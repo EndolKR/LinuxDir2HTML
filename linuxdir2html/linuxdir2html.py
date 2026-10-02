@@ -16,6 +16,9 @@
 #                      device setting, and a live progress counter while indexing.
 #                    - Reuse checksums from a previous report for files whose size and
 #                      modified time are unchanged (--reuse-hashes, or the existing output file).
+#                    - --title to set the page title.
+# v1.9.0             - Symlinks show their target (toggleable Target column). Links to folders and
+#                      broken links are now listed too, marked as such.
 
 # Prior to v1.6.1 symlinks filesizes were erroneously counted as the full files.
 # Now symlinked files are counted for however long the symlink itself is. If the symlink
@@ -34,6 +37,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import struct
 import sys
 import time
@@ -46,7 +50,7 @@ except ImportError:
 
 # Most of the following variables are to replace placeholders in template.html
 appName     = "LinuxDir2HTML"
-app_ver     = "1.8.0"
+app_ver     = "1.9.0"
 app_link    = "https://github.com/homeisfar/LinuxDir2HTML"
 total_numFiles  = 0
 total_numDirs   = 0
@@ -58,6 +62,7 @@ follow_symlink  = False
 hash_algo       = None
 date_format     = "%y/%m/%d %H:%M:%S"
 dir_results     = []
+has_links       = False  # whether any symlinks were found (decides if the Target column exists)
 reuse_hashes    = {}  # (path relative to root, size, mtime) -> hash, from previous reports
 childList_names = [] # names supplied from --child options
 startsList_names = [] # dir's generated from --startsfrom options
@@ -349,15 +354,30 @@ def js_json(obj):
     """JSON for embedding directly in an inline <script>."""
     return json.dumps(obj).replace('</', '<\\/')
 
+def link_field(path, kind):
+    """'' for non-links; otherwise the kind (f = to a file, d = to a folder, x = broken)
+    followed by the target exactly as stored in the link."""
+    global has_links
+    if not kind:
+        return ''
+    has_links = True
+    try:
+        target = os.readlink(path)
+    except OSError:
+        target = ''
+    return kind + js_str(target)
+
 def dir_header(path):
-    """First element of a directory's array: path, size placeholder, mtime, atime, btime."""
+    """First element of a directory's array: path, size placeholder, mtime, atime, btime, link.
+    (A folder can itself be a symlink when --symlink follows links.)"""
     try:
         st = os.stat(path)
         mtime, atime = int(st.st_mtime), int(st.st_atime)
     except (OSError, OverflowError, ValueError):
         logging.warning(f'----could not stat dir [{path}]')
         mtime = atime = 0
-    return SEP.join((js_str(path), '0', str(mtime), str(atime), opt_time(birth_time(path))))
+    return SEP.join((js_str(path), '0', str(mtime), str(atime), opt_time(birth_time(path)),
+                     link_field(path, 'd' if os.path.islink(path) else '')))
 
 def hash_file(path):
     """Return the hex digest of the file at path, or '' on error.
@@ -478,21 +498,31 @@ def generateDirArray(root_dir): # root i.e. user-provided root path, not "/"
             dirs_dictionary[current_dir] = [id, [dir_header(current_dir)], 0, '']
         arr = dirs_dictionary[current_dir][1]
 
-        ##### Enumerate FILES #####
+        ##### Enumerate FILES (including symlinks to files and broken symlinks) #####
         total_size = 0
         for file in files:
             full_file_path = os.path.join(current_dir, file)
-            try:
-                st = os.stat(full_file_path)        # follows symlinks, like isfile()
-            except OSError:
-                continue                            # broken symlink, vanished file, ...
-            if not os.path.isfile(full_file_path):
-                continue
-
             is_link = os.path.islink(full_file_path)
+            link_kind = ''
+            try:
+                st = os.stat(full_file_path)        # follows symlinks
+            except OSError:
+                if not is_link:
+                    continue                        # vanished file, ...
+                try:
+                    st = os.lstat(full_file_path)   # broken symlink: describe the link itself
+                except OSError:
+                    continue
+                link_kind = 'x'
+            else:
+                if not stat.S_ISREG(st.st_mode):
+                    continue                        # devices, fifos, sockets, or links to them
+                if is_link:
+                    link_kind = 'f'
+
             file_size = st.st_size
-            if is_link:
-                file_size = os.lstat(full_file_path).st_size
+            if link_kind == 'f':
+                file_size = os.lstat(full_file_path).st_size   # the link's own size
             try:  # Avoid possible invalid timestamps
                 mod_time = int(st.st_mtime)
                 acc_time = int(st.st_atime)
@@ -508,12 +538,12 @@ def generateDirArray(root_dir): # root i.e. user-provided root path, not "/"
             progress.bytes += file_size
 
             fields = [js_str(file), str(file_size), str(mod_time), str(acc_time),
-                      opt_time(birth_time(full_file_path))]
+                      opt_time(birth_time(full_file_path)), link_field(full_file_path, link_kind)]
             if hash_algo:
                 # The times above were read before hashing touches the file. Symlinks are
                 # only hashed with --symlink; otherwise the report describes the link itself.
                 digest = ''
-                if not is_link or follow_symlink:
+                if link_kind == '' or (link_kind == 'f' and follow_symlink):
                     key = (os.path.relpath(full_file_path, root_dir), file_size, mod_time)
                     digest = reuse_hashes.get(key, '')
                     if digest:
@@ -526,24 +556,42 @@ def generateDirArray(root_dir): # root i.e. user-provided root path, not "/"
                 fields.append(digest)
             arr.append(SEP.join(fields))
             progress.update()
-        dirs_dictionary[current_dir][2] = total_size
 
         ##### Enumerate DIRS #####
         dir_links = []
         for dir in dirs:
             full_dir_path = os.path.join(current_dir, dir)
-            if (not follow_symlink and os.path.isdir(full_dir_path) and not os.path.islink(full_dir_path)) or \
-                    (follow_symlink and os.path.isdir(full_dir_path)):
-                id += 1
-                total_numDirs += 1
-                # Header is filled in now so unreadable dirs (never walked) still show up properly
-                dirs_dictionary[full_dir_path] = [id, [dir_header(full_dir_path)], 0, '']
-                dir_links.append(str(id))
+            if not os.path.isdir(full_dir_path):
+                continue
+            if os.path.islink(full_dir_path) and not follow_symlink:
+                # Symlink to a folder: listed as an entry of this folder, but not followed.
+                # Size is the link's own size; times are the target's, like links to files.
+                try:
+                    st = os.stat(full_dir_path)
+                    link_size = os.lstat(full_dir_path).st_size
+                    mod_time, acc_time = int(st.st_mtime), int(st.st_atime)
+                except (OSError, OverflowError, ValueError):
+                    continue
+                total_size       += link_size
+                grand_total_size += link_size
+                fields = [js_str(dir), str(link_size), str(mod_time), str(acc_time),
+                          opt_time(birth_time(full_dir_path)), link_field(full_dir_path, 'd')]
+                if hash_algo:
+                    fields.append('')
+                arr.append(SEP.join(fields))
+                continue
+            id += 1
+            total_numDirs += 1
+            # Header is filled in now so unreadable dirs (never walked) still show up properly
+            dirs_dictionary[full_dir_path] = [id, [dir_header(full_dir_path)], 0, '']
+            dir_links.append(str(id))
+        dirs_dictionary[current_dir][2] = total_size
         dirs_dictionary[current_dir][3] = SEP.join(dir_links)
 
     ## Output format follows:
-    # "PATH\00\0MTIME\0ATIME\0BTIME","NAME\0SIZE\0MTIME\0ATIME\0BTIME[\0HASH]",...,DIR_SIZE,"ID1\0ID2..."
+    # "PATH\00\0MTIME\0ATIME\0BTIME\0LINK","NAME\0SIZE\0MTIME\0ATIME\0BTIME\0LINK[\0HASH]",...,DIR_SIZE,"ID1\0ID2..."
     # BTIME is empty when the filesystem doesn't record creation time.
+    # LINK is empty unless the entry is a symlink: then f/d/x (to file, to folder, broken) + target.
     # To get a practical sense of what this means, look at a generated output after using the program.
     for entry in dirs_dictionary:
         logging.debug(f'entry in dirs_dictionary [{str(entry)}]')
@@ -644,6 +692,7 @@ def generateHTML(title, display_title, assets_dir=None, assets_url=None):
         'dateFormat': date_format,
         'hashAlgo': hash_algo or '',
         'hashLabel': HASH_LABELS.get(hash_algo, hash_algo or ''),
+        'hasLinks': has_links,
     }
     replacements = {
         '[APP NAME]': appName,
