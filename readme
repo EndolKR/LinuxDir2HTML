@@ -1,0 +1,9 @@
+fork of https://github.com/homeisfar/LinuxDir2HTML
+
+changes:
+⋅ dark mode
+⋅ toggle columns
+⋅ hash/checksum
+⋅ progress indication
+⋅ modified/access/created
+⋅ shared assets to reduce filesize
