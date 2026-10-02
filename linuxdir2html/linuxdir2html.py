@@ -14,6 +14,8 @@
 #                    - File names are HTML-escaped in the viewer.
 # v1.8.0             - Created (birth) time, BLAKE3 hashing, column picker, theme follows the
 #                      device setting, and a live progress counter while indexing.
+#                    - Reuse checksums from a previous report for files whose size and
+#                      modified time are unchanged (--reuse-hashes, or the existing output file).
 
 # Prior to v1.6.1 symlinks filesizes were erroneously counted as the full files.
 # Now symlinked files are counted for however long the symlink itself is. If the symlink
@@ -56,6 +58,7 @@ follow_symlink  = False
 hash_algo       = None
 date_format     = "%y/%m/%d %H:%M:%S"
 dir_results     = []
+reuse_hashes    = {}  # (path relative to root, size, mtime) -> hash, from previous reports
 childList_names = [] # names supplied from --child options
 startsList_names = [] # dir's generated from --startsfrom options
 
@@ -91,6 +94,13 @@ parser.add_argument('--hash', nargs='?', const='default', choices=HASH_CHOICES +
                     help='Compute a checksum of every file (reads all file contents, so it can be slow). '
                          'ALGO defaults to blake3 if the blake3 package is installed (pip install blake3), '
                          'otherwise sha256. Choices: ' + ', '.join(HASH_CHOICES))
+parser.add_argument('--reuse-hashes', action='append', metavar='OLD.html',
+                    help='With --hash: reuse checksums from a previous report for files whose size and '
+                         'modified time are unchanged. Can be given more than once. If the output file '
+                         'already exists it is used automatically.')
+parser.add_argument('--no-reuse', action='store_true',
+                    help='With --hash: ignore previous reports, including the existing output file, '
+                         'and hash every file.')
 parser.add_argument('--date-format', default=date_format, metavar='FMT',
                     help='strftime-style format for dates in the report. Supported: %%Y %%y %%m %%d %%H %%M %%S %%b. '
                          'Default: "%(default)s", e.g. 26/10/31 23:42:12 for 31 Oct 2026')
@@ -146,6 +156,12 @@ def main():
     if os.path.isdir(title):
         logging.error(f"Chosen output file [{title}] is a directory. Aborting.")
         exit(1)
+    if (args.reuse_hashes or args.no_reuse) and not hash_algo:
+        logging.warning("--reuse-hashes/--no-reuse only apply together with --hash; ignoring.")
+    for old in args.reuse_hashes or []:
+        if not os.path.isfile(old):
+            logging.error(f"Report given to --reuse-hashes [{old}] doesn't exist. Aborting.")
+            exit(1)
     if args.assets_url and not args.assets:
         logging.error("--assets-url requires --assets. Aborting.")
         exit(1)
@@ -177,6 +193,16 @@ def main():
     # then generate the resulting HTML
     pathToIndex = Path(pathToIndex).resolve()
     logging.warning(f'Root index directory: [{pathToIndex}]')
+
+    # Previous reports to take checksums from: the ones named explicitly, plus the
+    # existing output file (read now, before it gets overwritten).
+    if hash_algo and not args.no_reuse:
+        explicit = [os.path.realpath(o) for o in args.reuse_hashes or []]
+        existing = os.path.realpath(f'{title}.html')
+        for source in explicit:
+            load_previous_hashes(source, explicit=True)
+        if os.path.isfile(existing) and existing not in explicit:
+            load_previous_hashes(existing, explicit=False)
     try:
         generateDirArray(str(pathToIndex))
     except KeyboardInterrupt:
@@ -207,6 +233,7 @@ class Progress:
         self.tty = sys.stderr.isatty()
         self.interval = 0.1 if self.tty else 15
         self.files = self.dirs = self.bytes = self.hashed = 0
+        self.reused = self.computed = 0
         self.current = ''
         self.start = time.monotonic()
         self.last = 0.0
@@ -217,7 +244,9 @@ class Progress:
         text = f'{human_time(elapsed)}  {self.files:,} files, {self.dirs:,} folders, {human_size(self.bytes)}'
         if hash_algo:
             rate = self.hashed / elapsed if elapsed > 0 else 0
-            text += f'  |  hashed {human_size(self.hashed)} ({human_size(rate)}/s)'
+            text += f'  |  hashed {self.computed:,} ({human_size(self.hashed)}, {human_size(rate)}/s)'
+            if reuse_hashes:
+                text += f', reused {self.reused:,}'
         if not self.current:
             return text
         path = self.current.encode('utf-8', 'replace').decode('utf-8').replace('\n', ' ')
@@ -258,7 +287,9 @@ class Progress:
         elapsed = time.monotonic() - self.start
         text = f'Indexed {self.files:,} files in {self.dirs:,} folders ({human_size(self.bytes)}) in {human_time(elapsed)}'
         if hash_algo:
-            text += f', hashed {human_size(self.hashed)}'
+            text += f', hashed {self.computed:,} files ({human_size(self.hashed)})'
+            if reuse_hashes:
+                text += f', reused {self.reused:,} hashes'
         sys.stderr.write(text + '\n')
         sys.stderr.flush()
 
@@ -355,6 +386,55 @@ def hash_file(path):
         return ''
     return h.hexdigest()
 
+def load_previous_hashes(report_path, explicit):
+    """Read checksums from a report made by this program (v1.7.0 or later) into reuse_hashes.
+    Entries are keyed by path relative to that report's root, so a re-mounted or moved
+    tree still matches. Only reports made with the same hash algorithm are used."""
+    old_algo = None
+    found = 0
+    root = None
+    try:
+        with open(report_path, 'r', encoding='utf-8', errors='surrogateescape') as f:
+            for line in f:
+                if old_algo is None and 'var LD2H_CONFIG = ' in line:
+                    cfg = json.loads(line.split('var LD2H_CONFIG = ', 1)[1].strip().rstrip(';'))
+                    old_algo = cfg.get('hashAlgo') or ''
+                    if old_algo != hash_algo:
+                        what = f'used {HASH_LABELS.get(old_algo, old_algo)}' if old_algo else 'has no checksums'
+                        logging.warning(f'Previous report [{report_path}] {what}; not reusing its hashes.')
+                        return
+                    continue
+                if not line.startswith('D.p(['):
+                    continue
+                if old_algo is None:     # data before any config: not one of our reports
+                    break
+                # Each line is D.p([...]); the array is JSON except for raw NUL separators,
+                # which strict=False accepts.
+                entry = json.loads(line.rstrip()[4:-1], strict=False)
+                dir_path = entry[0].split(SEP)[0]
+                if root is None:
+                    root = dir_path      # the first directory is the report's root
+                rel_dir = os.path.relpath(dir_path, root)
+                for item in entry[1:-2]:
+                    fields = item.split(SEP)
+                    digest = fields[-1]  # with hashing on, the checksum is always the last field
+                    if len(fields) < 5 or not digest:
+                        continue
+                    try:
+                        key = (os.path.normpath(os.path.join(rel_dir, fields[0])), int(fields[1]), int(fields[2]))
+                    except ValueError:
+                        continue
+                    reuse_hashes[key] = digest
+                    found += 1
+    except (OSError, ValueError, IndexError) as e:
+        logging.warning(f'Could not read previous report [{report_path}]: {e}')
+        return
+    if old_algo is None:
+        level = logging.WARNING if explicit else logging.INFO
+        logging.log(level, f'[{report_path}] is not a {appName} 1.7+ report; not reusing hashes from it.')
+        return
+    logging.warning(f'Loaded {found:,} reusable hashes from [{report_path}]')
+
 def generateDirArray(root_dir): # root i.e. user-provided root path, not "/"
     global total_numFiles, total_numDirs, grand_total_size, \
             dir_results, childList_names, startsList_names
@@ -431,9 +511,15 @@ def generateDirArray(root_dir): # root i.e. user-provided root path, not "/"
                 # only hashed with --symlink; otherwise the report describes the link itself.
                 digest = ''
                 if not is_link or follow_symlink:
-                    progress.current = full_file_path
-                    digest = hash_file(full_file_path)
-                    progress.current = current_dir
+                    key = (os.path.relpath(full_file_path, root_dir), file_size, mod_time)
+                    digest = reuse_hashes.get(key, '')
+                    if digest:
+                        progress.reused += 1
+                    else:
+                        progress.current = full_file_path
+                        digest = hash_file(full_file_path)
+                        progress.current = current_dir
+                        progress.computed += 1
                 fields.append(digest)
             arr.append(SEP.join(fields))
             progress.update()
