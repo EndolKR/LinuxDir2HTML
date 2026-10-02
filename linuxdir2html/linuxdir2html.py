@@ -87,6 +87,8 @@ parser.add_argument('pathToIndex', help='Path of Directory to Index')
 parser.add_argument('outputfile', help='Name of report file (without .html)')
 parser.add_argument('--child', action='append', help='[DEPRECATED] Exact name(s) of children directories to include')
 parser.add_argument('--startswith', action='append', help='[DEPRECATED] Start of name(s) of children dirs to include')
+parser.add_argument('--title', metavar='TEXT',
+                    help='Title shown in the browser tab and as the page heading. Default: the output file name.')
 parser.add_argument('--hidden', help='Include hidden files (leading with .)', action="store_true")
 parser.add_argument('--links', help='Create links to files in HTML output', action="store_true")
 parser.add_argument('--symlink', help='Follow symlinks. WARN: This can cause infinite loops.', action="store_true")
@@ -211,7 +213,8 @@ def main():
         exit(130)
     progress.done()
     logging.info('Outputting HTML...')
-    generateHTML(title, args.assets, args.assets_url)
+    display_title = args.title if args.title is not None else title
+    generateHTML(title, display_title, args.assets, args.assets_url)
     return
 
 def human_size(n):
@@ -626,7 +629,7 @@ def externalize_assets(template, output_path, assets_dir, assets_url):
     script = f'<script type="text/javascript" charset="utf-8" src="{html.escape(prefix + js_name)}"></script>'
     return f'{before}{link}{middle}{script}{after}'
 
-def generateHTML(title, assets_dir=None, assets_url=None):
+def generateHTML(title, display_title, assets_dir=None, assets_url=None):
     output_path = f'{title}.html'
     with open(Path(__file__).parent / 'template.html', 'r', encoding='utf-8') as f:
         template = f.read()
@@ -646,7 +649,7 @@ def generateHTML(title, assets_dir=None, assets_url=None):
         '[APP NAME]': appName,
         '[APP VER]': app_ver,
         '[GEN DATETIME]': html.escape(datetime.datetime.now().strftime(date_format)),
-        '[TITLE]': html.escape(title),
+        '[TITLE]': html.escape(display_title),
         '[APP LINK]': app_link,
         '[NUM FILES]': str(total_numFiles),
         '[NUM DIRS]': str(total_numDirs),
