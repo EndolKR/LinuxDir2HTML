@@ -7,5 +7,7 @@ changes:
 ⋅ progress indication
 ⋅ modified/access/created
 ⋅ shared assets to reduce filesize
+⋅ exclude filters
+⋅ folder/file counts
 
 (vibecoded changes fyi)

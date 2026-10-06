@@ -728,6 +728,22 @@
 			display: none;
 		}
 
+		/* --- Contents (recursive counts) column --- */
+
+		td.count {
+			white-space: nowrap;
+		}
+		td.count .count_detail {
+			color: #777;
+			font-size: 90%;
+		}
+		html.dark td.count .count_detail {
+			color: #9aa3ab;
+		}
+		html.hide-col-count .col-count {
+			display: none;
+		}
+
 		/* --- Symlinks --- */
 
 		.link_badge {

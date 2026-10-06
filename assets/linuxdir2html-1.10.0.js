@@ -165,6 +165,7 @@
 			var onlyLinkExtensions = [];	// example: ["jpg","png"]
 			var numDirs = dirs.length;
 			var treeSizeCache = [];	// memoized recursive folder sizes
+			var treeCountCache = [];	// memoized recursive {files, folders} per folder
 			var pathIndex = null;	// folder path -> id, built on first use (see dirIdForPath)
 			var originalHash = location.hash.replace(/^#/, "");	// read before the root folder overwrites it
 			try { originalHash = decodeURIComponent(originalHash); } catch (e) {}
@@ -234,6 +235,7 @@
 				{ key: "loc",   label: "Folder (search results)" },
 				{ key: "target", label: "Link target" },
 				{ key: "size",  label: "Size" },
+				{ key: "count", label: "Contents" },
 				{ key: "mtime", label: "Modified" },
 				{ key: "atime", label: "Accessed" },
 				{ key: "btime", label: "Created" }
@@ -351,11 +353,11 @@
 				var k = ["name"];
 				if (withLocation) k.push("loc");
 				if (hasLinks) k.push("target");
-				k.push("size", "mtime", "atime", "btime");
+				k.push("size", "count", "mtime", "atime", "btime");
 				if (hashAlgo) k.push("hash");
 				return k;
 			}
-			var COLUMN_TITLES = { name: "Name", loc: "Folder", target: "Link target", size: "Size",
+			var COLUMN_TITLES = { name: "Name", loc: "Folder", target: "Link target", size: "Size", count: "Contents",
 				mtime: "Modified", atime: "Accessed", btime: "Created", hash: hashLabel };
 
 			function tableHeader(withLocation) {
@@ -367,7 +369,7 @@
 			function sorterHeaders(withLocation) {
 				var keys = columnKeys(withLocation), h = {};
 				for (var i = 0; i < keys.length; i++) {
-					if (/^(size|mtime|atime|btime)$/.test(keys[i])) h[i] = { sorter: 'datasort' };
+					if (/^(size|count|mtime|atime|btime)$/.test(keys[i])) h[i] = { sorter: 'datasort' };
 				}
 				return h;
 			}
@@ -392,7 +394,9 @@
 				if (linkFiles && item.linkKind !== "x") {
 					var ext = name.split('.').pop();
 					if (onlyLinkExtensions.length === 0 || onlyLinkExtensions.indexOf(ext) !== -1) {
-						inner = "<a href=\"" + esc(fileUrl(dirPath, name)) + "\">" + esc(name) + "</a>";
+						try {
+							inner = "<a href=\"" + esc(fileUrl(dirPath, name)) + "\">" + esc(name) + "</a>";
+						} catch (e) {}	// unencodable name: show it without a link
 					}
 				}
 				return "<span class='file'>" + inner + linkBadge(item.linkKind) + "</span>";
@@ -415,6 +419,7 @@
 				if (locationCell !== null) h += "<td class='col-loc'>" + locationCell + "</td>";
 				if (hasLinks) h += "<td class='target col-target'>" + targetCell(item, linkDir) + "</td>";
 				h += "<td class='size col-size' data-sort='" + item.size + "' data-bytes='" + item.size + "'>" + bytesToSize(item.size) + "</td>";
+				h += countCell(item.counts);
 				h += "<td class='date col-mtime' data-sort='" + num(item.mtime) + "'>" + formatDate(item.mtime) + "</td>";
 				h += "<td class='date col-atime' data-sort='" + num(item.atime) + "'>" + formatDate(item.atime) + "</td>";
 				h += "<td class='date col-btime' data-sort='" + num(item.btime) + "'>" + formatDate(item.btime) + "</td>";
@@ -422,6 +427,17 @@
 					h += "<td class='hash col-hash'>" + (item.hash ? "<span title=\"" + esc(item.hash) + "\">" + esc(item.hash) + "</span>" : "") + "</td>";
 				}
 				return h + "</tr>\n";
+			}
+
+			// Contents column: total items (what it sorts by), then the files/folders split.
+			// Only real folders have counts; files and links to folders leave it blank.
+			function countCell(counts) {
+				if (!counts) return "<td class='count col-count' data-sort='-1'></td>";
+				var total = counts.files + counts.folders;
+				var detail = total === 0 ? "empty" :
+					plural(counts.files, "file") + ", " + plural(counts.folders, "folder");
+				return "<td class='count col-count' data-sort='" + total + "'>" + fmtInt(total) +
+					" <span class='count_detail'>(" + detail + ")</span></td>";
 			}
 
 			function typeLabel(isDir, kind) {
@@ -433,7 +449,7 @@
 
 			function viewEntry(item, path, isFolder) {
 				return { name: item.name, path: path, folder: isFolder, type: typeLabel(isFolder, item.linkKind),
-					target: item.linkTarget || "", size: item.size, mtime: item.mtime, atime: item.atime, btime: item.btime, hash: item.hash || "" };
+					target: item.linkTarget || "", counts: item.counts || null, size: item.size, mtime: item.mtime, atime: item.atime, btime: item.btime, hash: item.hash || "" };
 			}
 
 			function sizeSpan(bytes) {
@@ -478,6 +494,7 @@
 					var full = e.name;
 					var parentPath = full.substring(0, full.lastIndexOf("/")) || "/";
 					idx.push({ lc: getDirName(c).toLowerCase(), tlc: e.linkTarget.toLowerCase(), name: getDirName(c), size: getDirTreeSize(c),
+						counts: getDirTreeCounts(c),
 						mtime: e.mtime, atime: e.atime, btime: e.btime, hash: "", linkKind: e.linkKind, linkTarget: e.linkTarget,
 						isDir: true, dirId: c, locPath: parentPath, locId: parent_folders[c] });
 				}
@@ -639,7 +656,8 @@
 				for( c=0; c< subdirs.length; c++ ) {
 					countDirs++;
 					var e = parseEntry(dirs[ subdirs[c] ][0]);
-					var item = { name: getDirName(subdirs[c]), size: getDirTreeSize(subdirs[c]), mtime: e.mtime, atime: e.atime,
+					var item = { name: getDirName(subdirs[c]), size: getDirTreeSize(subdirs[c]), counts: getDirTreeCounts(subdirs[c]),
+						mtime: e.mtime, atime: e.atime,
 						btime: e.btime, hash: "", linkKind: e.linkKind, linkTarget: e.linkTarget };
 					dirBytes += item.size;
 					table_html += rowHtml(folderLink(subdirs[c], item.name, item.linkKind), null, item, currentViewPath);
@@ -731,6 +749,7 @@
 				var colBtime = $("#export_checkbox_col_btime").prop("checked");
 				var colHash = hashAlgo && $("#export_checkbox_col_hash").prop("checked");
 				var colTarget = hasLinks && $("#export_checkbox_col_target").prop("checked");
+				var colCount = $("#export_checkbox_col_count").prop("checked");
 
 				var type = $("#export_lightbox input[type='radio']:checked").val();
 
@@ -739,6 +758,7 @@
 				if(colType) head.push("Type");
 				if(colTarget) head.push("Target");
 				if(colSize) head.push("Size");
+				if(colCount) head.push("Items", "Files", "Folders");
 				if(colDate) head.push("Modified");
 				if(colAtime) head.push("Accessed");
 				if(colBtime) head.push("Created");
@@ -757,6 +777,16 @@
 					if(colType)  { json_line.type = v.type; csv.push(v.type); }
 					if(colTarget) { json_line.target = v.target; csv.push(v.target); }
 					if(colSize)  { json_line.size = v.size; csv.push(v.size); }
+					if(colCount) {
+						if (v.counts) {
+							json_line.items = v.counts.files + v.counts.folders;
+							json_line.files = v.counts.files;
+							json_line.folders = v.counts.folders;
+							csv.push(json_line.items, json_line.files, json_line.folders);
+						} else {
+							csv.push("", "", "");
+						}
+					}
 					if(colDate)  { json_line.modified = isoDate(v.mtime); csv.push(json_line.modified); }
 					if(colAtime) { json_line.accessed = isoDate(v.atime); csv.push(json_line.accessed); }
 					if(colBtime) { json_line.created = isoDate(v.btime); csv.push(json_line.created); }
@@ -840,8 +870,17 @@
 
 			function joinPath(dir, name) { return (dir.slice(-1) === "/" ? dir : dir + "/") + name; }
 
+			// Names that aren't valid UTF-8 reach us with each undecodable byte as a lone
+			// surrogate U+DC80..U+DCFF (Python's surrogateescape). encodeURI() throws on those,
+			// so emit them as the original byte, %XX, and encode the rest normally.
 			function fileUrl(dirPath, name) {
-				return encodeURI(linkProtocol + joinPath(dirPath, name)).replace(/#/g, "%23").replace(/\?/g, "%3F");
+				var parts = (linkProtocol + joinPath(dirPath, name)).split(/((?<![\uD800-\uDBFF])[\uDC80-\uDCFF])/);
+				var out = "";
+				for (var i = 0; i < parts.length; i++) {
+					if (i % 2 === 1) out += "%" + (parts[i].charCodeAt(0) - 0xDC00).toString(16).toUpperCase();
+					else if (parts[i]) out += encodeURI(parts[i]);
+				}
+				return out.replace(/#/g, "%23").replace(/\?/g, "%3F");
 			}
 
 			function tnum(s) { return (s === undefined || s === "") ? NaN : Number(s); }
@@ -968,6 +1007,32 @@
 				treeSizeCache[id] = totSize;
 				return totSize;
 			}
+
+			// Recursive count of everything under a folder. Links to folders count as folders
+			// (they're listed, not followed); everything else in a folder's list is a file.
+			function getDirTreeCounts( id ) {
+				if( treeCountCache[id] ) return treeCountCache[id];
+				var files = 0, folders = 0;
+				var len = dirs[id].length;
+				if (!hasLinks) {
+					files = len - 3;
+				} else {
+					for( var c=1; c<len-2; c++ ) {
+						if( (dirs[id][c].split(SEP)[5] || "").charAt(0) === "d" ) folders++; else files++;
+					}
+				}
+				var subdirs = getSubdirs( id );
+				for( var s=0; s<subdirs.length; s++ ) {
+					var sub = getDirTreeCounts( subdirs[s] );
+					files += sub.files;
+					folders += sub.folders + 1;
+				}
+				treeCountCache[id] = { files: files, folders: folders };
+				return treeCountCache[id];
+			}
+
+			function fmtInt(n) { return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
+			function plural(n, word) { return fmtInt(n) + " " + word + (n === 1 ? "" : "s"); }
 
 			// "iec": powers of 1024 (KiB, MiB, ...). "si": powers of 1000 (kB, MB, ...).
 			function bytesToSize(bytes) {

@@ -19,6 +19,9 @@
 #                    - --title to set the page title.
 # v1.9.0             - Symlinks show their target (toggleable Target column). Links to folders and
 #                      broken links are now listed too, marked as such.
+# v1.10.0            - Contents column (recursive file/folder counts).
+#                    - --exclude / --exclude-from with gitignore-style patterns.
+#                    - Hidden files are always included; --hidden is accepted but does nothing.
 
 # Prior to v1.6.1 symlinks filesizes were erroneously counted as the full files.
 # Now symlinked files are counted for however long the symlink itself is. If the symlink
@@ -50,19 +53,19 @@ except ImportError:
 
 # Most of the following variables are to replace placeholders in template.html
 appName     = "LinuxDir2HTML"
-app_ver     = "1.9.0"
+app_ver     = "1.10.0"
 app_link    = "https://github.com/homeisfar/LinuxDir2HTML"
 total_numFiles  = 0
 total_numDirs   = 0
 grand_total_size= 0
 link_files      = False
 link_protocol   = "file://"
-include_hidden  = False
 follow_symlink  = False
 hash_algo       = None
 date_format     = "%y/%m/%d %H:%M:%S"
 dir_results     = []
 has_links       = False  # whether any symlinks were found (decides if the Target column exists)
+exclude_rules   = []  # compiled --exclude / --exclude-from patterns, in order
 reuse_hashes    = {}  # (path relative to root, size, mtime) -> hash, from previous reports
 childList_names = [] # names supplied from --child options
 startsList_names = [] # dir's generated from --startsfrom options
@@ -94,7 +97,14 @@ parser.add_argument('--child', action='append', help='[DEPRECATED] Exact name(s)
 parser.add_argument('--startswith', action='append', help='[DEPRECATED] Start of name(s) of children dirs to include')
 parser.add_argument('--title', metavar='TEXT',
                     help='Title shown in the browser tab and as the page heading. Default: the output file name.')
-parser.add_argument('--hidden', help='Include hidden files (leading with .)', action="store_true")
+parser.add_argument('--hidden', action="store_true", help=argparse.SUPPRESS)  # no-op: hidden files are always included
+parser.add_argument('--exclude', action='append', metavar='PATTERN',
+                    help='Leave out files/folders matching a gitignore-style PATTERN, relative to the '
+                         'indexed folder (e.g. "*.tmp", "node_modules/", "/build", "**/cache", "!keep.log"). '
+                         'Can be given more than once. Excluded folders are not scanned.')
+parser.add_argument('--exclude-from', action='append', metavar='FILE',
+                    help='Read exclude patterns from FILE, one per line, in .gitignore syntax '
+                         '(# comments, ! to re-include). Can be given more than once.')
 parser.add_argument('--links', help='Create links to files in HTML output', action="store_true")
 parser.add_argument('--symlink', help='Follow symlinks. WARN: This can cause infinite loops.', action="store_true")
 parser.add_argument('--hash', nargs='?', const='default', choices=HASH_CHOICES + ['default'], metavar='ALGO',
@@ -122,7 +132,7 @@ parser.add_argument('--silent', help='Suppress terminal output except on error.'
 parser.add_argument('--version', help='Print version and exit', action="version", version=app_ver)
 
 def main():
-    global include_hidden, link_files, childList_names, startsList_names, follow_symlink, \
+    global link_files, childList_names, startsList_names, follow_symlink, \
             hash_algo, date_format
     args = parser.parse_args()
 
@@ -148,7 +158,6 @@ def main():
     pathToIndex = args.pathToIndex
     title = args.outputfile
     link_files = args.links
-    include_hidden = args.hidden
     hash_algo = DEFAULT_HASH if args.hash == 'default' else args.hash
     if hash_algo == 'blake3' and blake3 is None:
         logging.error("--hash blake3 needs the blake3 package: pip install blake3")
@@ -169,6 +178,20 @@ def main():
         if not os.path.isfile(old):
             logging.error(f"Report given to --reuse-hashes [{old}] doesn't exist. Aborting.")
             exit(1)
+    # Exclude patterns: files first, then --exclude, so the command line can override a file
+    # (later patterns win, as in .gitignore).
+    for path in args.exclude_from or []:
+        try:
+            with open(path, 'r', encoding='utf-8', errors='surrogateescape') as f:
+                lines = f.read().splitlines()
+        except OSError as e:
+            logging.error(f"Can't read --exclude-from file [{path}]: {e.strerror}. Aborting.")
+            exit(1)
+        added = add_exclude_patterns(lines)
+        logging.info(f"Loaded {added} exclude pattern(s) from [{path}]")
+    add_exclude_patterns(args.exclude or [])
+    if exclude_rules:
+        logging.info(f"Using {len(exclude_rules)} exclude pattern(s)")
     if args.assets_url and not args.assets:
         logging.error("--assets-url requires --assets. Aborting.")
         exit(1)
@@ -178,7 +201,6 @@ def main():
                         "will appear literally in the report.")
 
     logging.info(f"Creating file links is [{link_files}]")
-    logging.info(f"Showing hidden items is [{include_hidden}]")
     logging.info(f"Following symlinks is [{follow_symlink}]")
     logging.info(f"Hashing files is [{hash_algo or False}]")
     if not birthtime_supported():
@@ -242,6 +264,7 @@ class Progress:
         self.interval = 0.1 if self.tty else 15
         self.files = self.dirs = self.bytes = self.hashed = 0
         self.reused = self.computed = 0
+        self.excluded = 0
         self.current = ''
         self.start = time.monotonic()
         self.last = 0.0
@@ -298,6 +321,8 @@ class Progress:
             text += f', hashed {self.computed:,} files ({human_size(self.hashed)})'
             if reuse_hashes:
                 text += f', reused {self.reused:,} hashes'
+        if exclude_rules:
+            text += f', excluded {self.excluded:,} items'
         sys.stderr.write(text + '\n')
         sys.stderr.flush()
 
@@ -342,6 +367,109 @@ def birth_time(path):
 
 def opt_time(t):
     return '' if t is None else str(t)
+
+# ---- gitignore-style exclude patterns ----
+# Supported (as in .gitignore): blank lines and # comments, trailing spaces trimmed (unless
+# escaped with \), ! negation (last matching pattern wins), trailing / = folders only, a /
+# at the start or middle anchors the pattern to the indexed folder (otherwise it matches at
+# any depth), * and ? (never matching /), [abc] / [!abc] classes, ** for any number of
+# folders ("**/x", "x/**", "a/**/b"), and \ to escape a special character.
+# As in git, a file inside an excluded folder can't be re-included (the folder isn't scanned).
+
+class ExcludeRule:
+    def __init__(self, regex, negate, dir_only, source):
+        self.regex, self.negate, self.dir_only, self.source = regex, negate, dir_only, source
+
+def _glob_segment(seg):
+    """Regex for one path segment of a pattern (contains no /)."""
+    out, i, n = [], 0, len(seg)
+    while i < n:
+        c = seg[i]
+        if c == '\\' and i + 1 < n:
+            out.append(re.escape(seg[i + 1]))
+            i += 2
+        elif c == '*':
+            while i < n and seg[i] == '*':
+                i += 1
+            out.append('[^/]*')
+        elif c == '?':
+            out.append('[^/]')
+            i += 1
+        elif c == '[':
+            j = i + 1
+            if j < n and seg[j] in '!^':
+                j += 1
+            if j < n and seg[j] == ']':
+                j += 1
+            while j < n and seg[j] != ']':
+                j += 1
+            if j >= n:                      # no closing bracket: literal [
+                out.append(re.escape(c))
+                i += 1
+                continue
+            body = seg[i + 1:j]
+            negate = body[:1] in ('!', '^')
+            if negate:
+                body = body[1:]
+            body = body.replace('\\', '\\\\').replace('[', '\\[')
+            out.append(('[^/' if negate else '[') + body + ']')
+            i = j + 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return ''.join(out)
+
+def compile_exclude(line):
+    """ExcludeRule for one gitignore-style line, or None for blanks/comments."""
+    source = line
+    if line.startswith('#'):
+        return None
+    line = re.sub(r'(?<!\\) +$', '', line)       # trailing unescaped spaces
+    negate = False
+    if line.startswith('!'):
+        negate, line = True, line[1:]
+    elif line.startswith(('\\!', '\\#')):
+        line = line[1:]
+    dir_only = line.endswith('/')
+    line = line.rstrip('/')
+    if not line:
+        return None
+    anchored = '/' in line                       # leading or middle slash
+    segments = line.lstrip('/').split('/')
+    rx = ''
+    for i, seg in enumerate(segments):
+        first, last = i == 0, i == len(segments) - 1
+        if seg == '**':
+            if last:
+                rx += '.*' if first else '/.*'
+            else:
+                rx += '(?:.*/)?' if first else '/(?:.*/)?'
+        else:
+            if not first and segments[i - 1] != '**':
+                rx += '/'
+            rx += _glob_segment(seg)
+    if not anchored:
+        rx = '(?:.*/)?' + rx
+    return ExcludeRule(re.compile(rx + r'\Z', re.DOTALL), negate, dir_only, source)
+
+def add_exclude_patterns(lines):
+    added = 0
+    for line in lines:
+        rule = compile_exclude(line)
+        if rule:
+            exclude_rules.append(rule)
+            added += 1
+    return added
+
+def is_excluded(rel_path, is_dir):
+    """rel_path uses / and is relative to the indexed folder. Last matching rule wins."""
+    excluded = False
+    for rule in exclude_rules:
+        if rule.dir_only and not is_dir:
+            continue
+        if rule.regex.match(rel_path):
+            excluded = not rule.negate
+    return excluded
 
 def js_str(s):
     """Escape a string for use inside a double-quoted JS string in an inline <script>."""
@@ -477,12 +605,18 @@ def generateDirArray(root_dir): # root i.e. user-provided root path, not "/"
         if first_iteration:
             first_iteration = False
             if childList_names or startsList_names:
-                selectDirs(current_dir, dirs, include_hidden)
+                selectDirs(current_dir, dirs)
                 files = []
 
-        if include_hidden is False:
-            dirs[:] = [d for d in dirs if not d[0] == '.']
-            files = [f for f in files if not f[0] == '.']
+        if exclude_rules:
+            # Pruning dirs in place stops os.walk from descending into excluded folders
+            rel_dir = os.path.relpath(current_dir, root_dir)
+            prefix = '' if rel_dir == '.' else rel_dir + '/'
+            kept_dirs = [d for d in dirs if not is_excluded(prefix + d, True)]
+            kept_files = [f for f in files if not is_excluded(prefix + f, False)]
+            progress.excluded += len(dirs) - len(kept_dirs) + len(files) - len(kept_files)
+            dirs[:] = kept_dirs
+            files = kept_files
 
         dirs = sorted(dirs, key=str.casefold)
         files = sorted(files, key=str.casefold)
@@ -604,17 +738,14 @@ def generateDirArray(root_dir): # root i.e. user-provided root path, not "/"
 
 # This function will execute only on the first iteration of the directory walk.
 # It only has an effect if --child or --startswith are used.
-def selectDirs(current_dir, dirs, include_hidden):
+def selectDirs(current_dir, dirs):
     if childList_names:
         logging.warning(f'Using dirs Named [{str(childList_names)[1:-1]}]')
-    hidden_dirs = []
     if startsList_names:
         logging.warning(f'Using dirs starting with [{str(startsList_names)[1:-1]}]')
-        if include_hidden:
-            hidden_dirs = ["."+d for d in startsList_names]
-            logging.warning(f'Hidden flag set. Using dirs starting with [{str(hidden_dirs)[1:-1]}]')
 
-    desired_dirs = startsList_names + hidden_dirs
+    # Hidden folders are always included, so ".name" also matches --startswith name
+    desired_dirs = startsList_names + ["." + d for d in startsList_names]
     for i in range(len(dirs) -1, -1, -1):
         keep_dir = '?'
         for desired in desired_dirs:
